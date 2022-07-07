@@ -2,8 +2,8 @@ extern crate libc;
 
 use sscanf::scanf;
 use std::cmp;
-use std::io;
-use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Error, ErrorKind, Read, Result, Write};
 use std::slice;
 
 use termios::*;
@@ -11,16 +11,17 @@ use termios::*;
 use libc::{ioctl, winsize, STDOUT_FILENO, TIOCGWINSZ};
 
 #[derive(Copy, Clone)]
-enum EditorKey {
-    ARROW_LEFT = 1000,
-    ARROW_RIGHT,
-    ARROW_UP,
-    ARROW_DOWN,
-    DEL_KEY,
-    HOME_KEY,
-    END_KEY,
-    PAGE_UP,
-    PAGE_DOWN,
+enum EKey {
+    Escape = '\x1b' as isize, // 27
+    ArrowLeft = 1000,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    DelKey,
+    HomeKey,
+    EndKey,
+    PageUp,
+    PageDown,
 }
 
 const EAGAIN: i32 = 11;
@@ -63,10 +64,6 @@ fn disable_raw_mode(orig_term: &Termios) {
     }
 }
 
-// fn ctrl_key(c: char) -> u8 {
-//     return (c as u8) & 0x1f;
-// }
-
 // note: diverging function, returns !
 fn die(msg: &str, error: &str) -> ! {
     io::stdout().write(b"\x1b[2J").unwrap();
@@ -82,23 +79,51 @@ pub struct Editor {
     screen_rows: usize,
     screen_cols: usize,
     orig_term: Termios,
+    erows: Vec<String>,
+    nrows: usize,
 }
 
 impl Editor {
-    pub fn new() -> Self {
+    pub fn new(filename_opt: Option<&String>) -> Self {
         let orig_term = enable_raw_mode();
 
-        let (rows, cols) = Editor::get_win_size().unwrap_or_else(|err| {
+        let (screen_rows, screen_cols) = Editor::get_win_size().unwrap_or_else(|err| {
             die("getWindowSize", &err.to_string());
+        });
+
+        let (nrows, erows) = Editor::open_file(filename_opt).unwrap_or_else(|err| {
+            die("fopen", &err.to_string());
         });
 
         Self {
             cx: 0,
             cy: 0,
-            screen_rows: rows,
-            screen_cols: cols,
+            screen_rows,
+            screen_cols,
             orig_term,
+            erows,
+            nrows,
         }
+    }
+
+    pub fn open_file(filename_opt: Option<&String>) -> Result<(usize, Vec<String>)> {
+        // read file
+        let mut nrows: usize = 0;
+        let mut erows = Vec::new();
+        if let Some(filename) = filename_opt {
+            let file = File::open(filename)?;
+            // NOTE: Each line (string) from lines() will not have \n or \r at the end
+            // TODO: optimize by reusing buffer for buffer reader. See https://stackoverflow.com/questions/45882329/read-large-files-line-by-line-in-rust
+            for line in BufReader::new(file).lines() {
+                if let Ok(ip) = line {
+                    // we need to append this to the erows
+                    erows.push(ip);
+                    nrows += 1;
+                }
+            }
+        }
+
+        return Ok((nrows, erows));
     }
 
     pub fn run(&mut self) {
@@ -110,24 +135,31 @@ impl Editor {
 
     fn draw_rows(&self, buf: &mut String) {
         for y in 0..self.screen_rows {
-            if y == self.screen_rows / 3 {
-                let welcome_msg = format!("carp editor -- version {}", CARP_VER);
-                let screen_len = cmp::min(self.screen_cols, welcome_msg.len());
-                let mut padding = (self.screen_cols - screen_len) / 2;
+            if y >= self.nrows {
+                // beyond the number of lines in the opened file
+                if self.nrows == 0 && y == self.screen_rows / 3 {
+                    let welcome_msg = format!("carp editor -- version {}", CARP_VER);
+                    let screen_len = cmp::min(self.screen_cols, welcome_msg.len());
+                    let mut padding = (self.screen_cols - screen_len) / 2;
 
-                if padding > 0 {
+                    if padding > 0 {
+                        buf.push_str("~");
+                        padding -= 1;
+                    }
+
+                    while padding > 0 {
+                        buf.push_str(" ");
+                        padding -= 1;
+                    }
+
+                    buf.push_str(&welcome_msg[..screen_len]);
+                } else {
                     buf.push_str("~");
-                    padding -= 1;
                 }
-
-                while padding > 0 {
-                    buf.push_str(" ");
-                    padding -= 1;
-                }
-
-                buf.push_str(&welcome_msg[..screen_len]);
             } else {
-                buf.push_str("~");
+                // append file contents to buffer
+                let max_len = cmp::min(self.screen_cols, self.erows[y].len());
+                buf.push_str(&self.erows[y][..max_len]);
             }
 
             // clear line to right of cursor position
@@ -162,22 +194,20 @@ impl Editor {
         io::stdout().flush().unwrap();
     }
 
-    fn move_cursor(&mut self, key: u8) {
-        eprintln!("ARROW_LEFT as u8: {}", EditorKey::ARROW_LEFT as u8);
-
-        if key == EditorKey::ARROW_LEFT as u8 {
+    fn move_cursor(&mut self, key: u32) {
+        if key == EKey::ArrowLeft as u32 {
             if self.cx != 0 {
                 self.cx -= 1;
             }
-        } else if key == EditorKey::ARROW_DOWN as u8 {
+        } else if key == EKey::ArrowDown as u32 {
             if self.cy != self.screen_rows - 1 {
                 self.cy += 1;
             }
-        } else if key == EditorKey::ARROW_UP as u8 {
+        } else if key == EKey::ArrowUp as u32 {
             if self.cy != 0 {
                 self.cy -= 1;
             }
-        } else if key == EditorKey::ARROW_RIGHT as u8 {
+        } else if key == EKey::ArrowRight as u32 {
             if self.cx != self.screen_cols - 1 {
                 self.cx += 1;
             }
@@ -185,8 +215,8 @@ impl Editor {
     }
 
     fn process_keypress(&mut self) {
-        let key: u8 = Editor::read_key();
-        let bits_q: u8 = ('q' as u8) & 0x1f;
+        let key: u32 = Editor::read_key();
+        let bits_q: u32 = ('q' as u32) & 0x1f;
 
         if key == bits_q {
             io::stdout().write(b"\x1b[2J").unwrap();
@@ -196,37 +226,37 @@ impl Editor {
             std::process::exit(0);
         }
 
-        let vec_keys2u8 = |v: Vec<EditorKey>| v.iter().map(|x| *x as u8).collect();
+        let vec_keys2u32 = |v: Vec<EKey>| v.iter().map(|x| *x as u32).collect();
 
-        let page_keys: Vec<u8> = vec_keys2u8(vec![EditorKey::PAGE_DOWN, EditorKey::PAGE_UP]);
-        let arrow_keys: Vec<u8> = vec_keys2u8(vec![
-            EditorKey::ARROW_UP,
-            EditorKey::ARROW_DOWN,
-            EditorKey::ARROW_LEFT,
-            EditorKey::ARROW_RIGHT,
+        let page_keys: Vec<u32> = vec_keys2u32(vec![EKey::PageDown, EKey::PageUp]);
+        let arrow_keys: Vec<u32> = vec_keys2u32(vec![
+            EKey::ArrowUp,
+            EKey::ArrowDown,
+            EKey::ArrowLeft,
+            EKey::ArrowRight,
         ]);
 
         if page_keys.contains(&key) {
             // note: on macOS, we need to press Shift + Fn + Up/Down arrows to register it as Page Up/Down
             let times = self.screen_rows;
             for _ in 0..times {
-                let correct_arrow = if key == (EditorKey::PAGE_UP as u8) {
-                    EditorKey::ARROW_UP
+                let correct_arrow = if key == (EKey::PageUp as u32) {
+                    EKey::ArrowUp
                 } else {
-                    EditorKey::ARROW_DOWN
+                    EKey::ArrowDown
                 };
-                self.move_cursor(correct_arrow as u8);
+                self.move_cursor(correct_arrow as u32);
             }
         } else if arrow_keys.contains(&key) {
             self.move_cursor(key);
-        } else if key == EditorKey::HOME_KEY as u8 {
+        } else if key == EKey::HomeKey as u32 {
             self.cx = 0;
-        } else if key == EditorKey::END_KEY as u8 {
+        } else if key == EKey::EndKey as u32 {
             self.cx = self.screen_cols - 1;
         }
     }
 
-    fn read_key() -> u8 {
+    fn read_key() -> u32 {
         let mut buffer = [0; 1];
 
         while let Err(err) = io::stdin().read_exact(&mut buffer) {
@@ -245,7 +275,7 @@ impl Editor {
                     .read_exact(slice::from_mut(&mut seq[i]))
                     .is_err()
                 {
-                    return '\x1b' as u8;
+                    return '\x1b' as u32;
                 }
             }
 
@@ -258,44 +288,44 @@ impl Editor {
                         .read_exact(slice::from_mut(&mut seq[2]))
                         .is_err()
                     {
-                        return '\x1b' as u8;
+                        return '\x1b' as u32;
                     }
 
                     let third_ch = seq[2] as char;
 
                     if third_ch == '~' {
                         return match second_ch {
-                            '1' | '7' => EditorKey::HOME_KEY as u8,
-                            '3' => EditorKey::DEL_KEY as u8,
-                            '4' | '8' => EditorKey::END_KEY as u8,
-                            '5' => EditorKey::PAGE_UP as u8,
-                            '6' => EditorKey::PAGE_DOWN as u8,
-                            _ => '\x1b' as u8,
-                        };
+                            '1' | '7' => EKey::HomeKey,
+                            '3' => EKey::DelKey,
+                            '4' | '8' => EKey::EndKey,
+                            '5' => EKey::PageUp,
+                            '6' => EKey::PageDown,
+                            _ => EKey::Escape,
+                        } as u32;
                     }
                 } else {
                     return match seq[1] as char {
-                        'A' => EditorKey::ARROW_UP as u8,
-                        'B' => EditorKey::ARROW_DOWN as u8,
-                        'C' => EditorKey::ARROW_RIGHT as u8,
-                        'D' => EditorKey::ARROW_LEFT as u8,
-                        'H' => EditorKey::HOME_KEY as u8,
-                        'F' => EditorKey::END_KEY as u8,
-                        _ => '\x1b' as u8,
-                    };
+                        'A' => EKey::ArrowUp,
+                        'B' => EKey::ArrowDown,
+                        'C' => EKey::ArrowRight,
+                        'D' => EKey::ArrowLeft,
+                        'H' => EKey::HomeKey,
+                        'F' => EKey::EndKey,
+                        _ => EKey::Escape,
+                    } as u32;
                 }
             } else if seq[0] as char == 'O' {
                 return match seq[1] as char {
-                    'H' => EditorKey::HOME_KEY as u8,
-                    'F' => EditorKey::END_KEY as u8,
-                    _ => '\x1b' as u8,
-                };
+                    'H' => EKey::HomeKey,
+                    'F' => EKey::EndKey,
+                    _ => EKey::Escape,
+                } as u32;
             }
 
-            return '\x1b' as u8;
+            return '\x1b' as u32;
         }
 
-        return buffer[0];
+        return buffer[0] as u32;
     }
 
     fn get_cursor_pos() -> Result<(usize, usize)> {
