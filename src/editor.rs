@@ -4,6 +4,7 @@ use sscanf::scanf;
 use std::cmp;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind, Read, Result, Write};
+use std::path::Path;
 use std::slice;
 
 use termios::*;
@@ -81,6 +82,8 @@ pub struct Editor {
     orig_term: Termios,
     erows: Vec<String>,
     nrows: usize,
+    roffset: usize,
+    coffset: usize,
 }
 
 impl Editor {
@@ -91,7 +94,7 @@ impl Editor {
             die("getWindowSize", &err.to_string());
         });
 
-        let (nrows, erows) = Editor::open_file(filename_opt).unwrap_or_else(|err| {
+        let (nrows, erows) = Editor::read_file(filename_opt).unwrap_or_else(|err| {
             die("fopen", &err.to_string());
         });
 
@@ -103,10 +106,15 @@ impl Editor {
             orig_term,
             erows,
             nrows,
+            roffset: 0,
+            coffset: 0,
         }
     }
 
-    pub fn open_file(filename_opt: Option<&String>) -> Result<(usize, Vec<String>)> {
+    pub fn read_file<P>(filename_opt: Option<&P>) -> Result<(usize, Vec<String>)>
+    where
+        P: AsRef<Path>,
+    {
         // read file
         let mut nrows: usize = 0;
         let mut erows = Vec::new();
@@ -135,7 +143,9 @@ impl Editor {
 
     fn draw_rows(&self, buf: &mut String) {
         for y in 0..self.screen_rows {
-            if y >= self.nrows {
+            let abs_y = y + self.roffset; // y position in file
+
+            if abs_y >= self.nrows {
                 // beyond the number of lines in the opened file
                 if self.nrows == 0 && y == self.screen_rows / 3 {
                     let welcome_msg = format!("carp editor -- version {}", CARP_VER);
@@ -158,8 +168,11 @@ impl Editor {
                 }
             } else {
                 // append file contents to buffer
-                let max_len = cmp::min(self.screen_cols, self.erows[y].len());
-                buf.push_str(&self.erows[y][..max_len]);
+                let line_len = self.erows[abs_y].len();
+                if self.coffset < line_len {
+                    let max_len = cmp::min(self.screen_cols, line_len - self.coffset);
+                    buf.push_str(&self.erows[abs_y][self.coffset..self.coffset + max_len]);
+                }
             }
 
             // clear line to right of cursor position
@@ -172,7 +185,30 @@ impl Editor {
         }
     }
 
-    fn refresh_screen(&self) {
+    fn scroll_screen(&mut self) {
+        // if cursor goes above the top of screen display, change roffset
+        if self.cy < self.roffset {
+            self.roffset = self.cy;
+        }
+
+        // if cursor goes below the bottom of screen, handle accordingly
+        if self.cy >= self.roffset + self.screen_rows {
+            self.roffset = self.cy - (self.screen_rows - 1);
+        }
+
+        // same for horizontal scrolling
+        if self.cx < self.coffset {
+            self.coffset = self.cx;
+        }
+
+        if self.cx >= self.coffset + self.screen_cols {
+            self.coffset = self.cx - (self.screen_cols - 1);
+        }
+    }
+
+    fn refresh_screen(&mut self) {
+        self.scroll_screen();
+
         let mut buf = String::new();
 
         // hide cursor before refresh screen
@@ -185,7 +221,11 @@ impl Editor {
         self.draw_rows(&mut buf);
 
         // draw cursor position
-        buf.push_str(&format!("\x1b[{};{}H", self.cy + 1, self.cx + 1));
+        buf.push_str(&format!(
+            "\x1b[{};{}H",
+            (self.cy - self.roffset) + 1,
+            (self.cx - self.coffset) + 1,
+        ));
 
         // show cursor again
         buf.push_str("\x1b[?25h");
@@ -195,22 +235,38 @@ impl Editor {
     }
 
     fn move_cursor(&mut self, key: u32) {
+        let row = self.erows.get(self.cy);
+
         if key == EKey::ArrowLeft as u32 {
             if self.cx != 0 {
                 self.cx -= 1;
+            } else if self.cy > 0 {
+                self.cy -= 1;
+                self.cx = self.erows[self.cy].len();
+            }
+        } else if key == EKey::ArrowRight as u32 {
+            if row.is_some() && self.cx < row.unwrap().len() {
+                self.cx += 1;
+            } else if row.is_some() {
+                // implicitly also self.cx == row.unwrap().len()
+                self.cy += 1;
+                self.cx = 0;
             }
         } else if key == EKey::ArrowDown as u32 {
-            if self.cy != self.screen_rows - 1 {
+            // this condition causes us to go one line below the last line in text file
+            if self.cy < self.nrows {
                 self.cy += 1;
             }
         } else if key == EKey::ArrowUp as u32 {
             if self.cy != 0 {
                 self.cy -= 1;
             }
-        } else if key == EKey::ArrowRight as u32 {
-            if self.cx != self.screen_cols - 1 {
-                self.cx += 1;
-            }
+        }
+
+        // when going down / up, we might end up with a cursor that is past the length of that row
+        let row_after_len = self.erows.get(self.cy).map_or(0, |s| s.len());
+        if self.cx > row_after_len {
+            self.cx = row_after_len;
         }
     }
 
