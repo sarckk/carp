@@ -27,6 +27,7 @@ enum EKey {
 
 const EAGAIN: i32 = 11;
 const CARP_VER: &str = "0.0.1";
+const TAB_WIDTH: usize = 8;
 
 fn enable_raw_mode() -> Termios {
     let termios = match Termios::from_fd(0) {
@@ -76,11 +77,13 @@ fn die(msg: &str, error: &str) -> ! {
 
 pub struct Editor {
     cx: usize,
+    rx: usize, // render index
     cy: usize,
     screen_rows: usize,
     screen_cols: usize,
     orig_term: Termios,
     erows: Vec<String>,
+    render_rows: Vec<String>,
     nrows: usize,
     roffset: usize,
     coffset: usize,
@@ -98,20 +101,51 @@ impl Editor {
             die("fopen", &err.to_string());
         });
 
+        let render_rows = Editor::convert_to_rendered(&erows);
+
         Self {
             cx: 0,
+            rx: 0,
             cy: 0,
             screen_rows,
             screen_cols,
             orig_term,
-            erows,
+            erows, // NOTE: here erows variable above is moved and becomes invalid after this line
+            render_rows,
             nrows,
             roffset: 0,
             coffset: 0,
         }
     }
 
-    pub fn read_file<P>(filename_opt: Option<&P>) -> Result<(usize, Vec<String>)>
+    fn convert_to_rendered(erows: &Vec<String>) -> Vec<String> {
+        let mut rrows = Vec::new();
+
+        for line in erows {
+            // replace all tab characters in the line with appropriate number of spaces
+            let mut new_line = String::new();
+            let mut tabs = 0;
+            for ch in line.chars() {
+                if ch == '\t' {
+                    new_line.push(' ');
+                    if (tabs + 1) % TAB_WIDTH != 0 {
+                        let nspaces = TAB_WIDTH - ((tabs + 1) % TAB_WIDTH);
+                        let tab_spaces = " ".repeat(nspaces);
+                        new_line.push_str(&tab_spaces);
+                    }
+                    tabs = 0;
+                } else {
+                    new_line.push(ch);
+                    tabs += 1;
+                }
+            }
+            rrows.push(new_line);
+        }
+
+        return rrows;
+    }
+
+    fn read_file<P>(filename_opt: Option<&P>) -> Result<(usize, Vec<String>)>
     where
         P: AsRef<Path>,
     {
@@ -168,10 +202,10 @@ impl Editor {
                 }
             } else {
                 // append file contents to buffer
-                let line_len = self.erows[abs_y].len();
+                let line_len = self.render_rows[abs_y].len();
                 if self.coffset < line_len {
                     let max_len = cmp::min(self.screen_cols, line_len - self.coffset);
-                    buf.push_str(&self.erows[abs_y][self.coffset..self.coffset + max_len]);
+                    buf.push_str(&self.render_rows[abs_y][self.coffset..self.coffset + max_len]);
                 }
             }
 
@@ -185,7 +219,28 @@ impl Editor {
         }
     }
 
+    fn cx_to_rx(erows: &str, cx: usize) -> usize {
+        let mut rx = 0;
+
+        eprintln!("cx: {}", cx);
+        for i in 0..cx {
+            eprintln!("erows length: {}", erows.as_bytes().len());
+            if (erows.as_bytes()[i] as char) == '\t' {
+                rx += (TAB_WIDTH - 1) - (rx % TAB_WIDTH);
+            }
+            rx += 1;
+        }
+
+        return rx;
+    }
+
     fn scroll_screen(&mut self) {
+        self.rx = self.cx;
+        if self.cy < self.nrows {
+            // we are not at the last allowed line of the editor (i.e. one line after end of text)
+            self.rx = Editor::cx_to_rx(&self.erows[self.cy], self.cx);
+        }
+
         // if cursor goes above the top of screen display, change roffset
         if self.cy < self.roffset {
             self.roffset = self.cy;
@@ -197,12 +252,12 @@ impl Editor {
         }
 
         // same for horizontal scrolling
-        if self.cx < self.coffset {
-            self.coffset = self.cx;
+        if self.rx < self.coffset {
+            self.coffset = self.rx;
         }
 
-        if self.cx >= self.coffset + self.screen_cols {
-            self.coffset = self.cx - (self.screen_cols - 1);
+        if self.rx >= self.coffset + self.screen_cols {
+            self.coffset = self.rx - (self.screen_cols - 1);
         }
     }
 
@@ -224,7 +279,7 @@ impl Editor {
         buf.push_str(&format!(
             "\x1b[{};{}H",
             (self.cy - self.roffset) + 1,
-            (self.cx - self.coffset) + 1,
+            (self.rx - self.coffset) + 1,
         ));
 
         // show cursor again
@@ -295,20 +350,29 @@ impl Editor {
         if page_keys.contains(&key) {
             // note: on macOS, we need to press Shift + Fn + Up/Down arrows to register it as Page Up/Down
             let times = self.screen_rows;
+            let arrow_key;
+            if key == (EKey::PageUp as u32) {
+                self.cy = self.roffset; // position cursor at the top of screen
+                arrow_key = EKey::ArrowUp;
+            } else {
+                self.cy = self.roffset + self.screen_rows - 1;
+                if self.cy > self.nrows {
+                    self.cy = self.nrows;
+                }
+                arrow_key = EKey::ArrowDown;
+            }
+
             for _ in 0..times {
-                let correct_arrow = if key == (EKey::PageUp as u32) {
-                    EKey::ArrowUp
-                } else {
-                    EKey::ArrowDown
-                };
-                self.move_cursor(correct_arrow as u32);
+                self.move_cursor(arrow_key as u32);
             }
         } else if arrow_keys.contains(&key) {
             self.move_cursor(key);
         } else if key == EKey::HomeKey as u32 {
             self.cx = 0;
         } else if key == EKey::EndKey as u32 {
-            self.cx = self.screen_cols - 1;
+            if self.cy < self.nrows {
+                self.cx = self.erows[self.cy].len();
+            }
         }
     }
 
