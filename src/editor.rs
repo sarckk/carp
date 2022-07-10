@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind, Read, Result, Write};
 use std::path::Path;
 use std::slice;
+use std::time::Instant;
 
 use termios::*;
 
@@ -28,6 +29,7 @@ enum EKey {
 const EAGAIN: i32 = 11;
 const CARP_VER: &str = "0.0.1";
 const TAB_WIDTH: usize = 8;
+const STATUS_HEIGHT: usize = 2;
 
 fn enable_raw_mode() -> Termios {
     let termios = match Termios::from_fd(0) {
@@ -87,6 +89,9 @@ pub struct Editor {
     nrows: usize,
     roffset: usize,
     coffset: usize,
+    filename: Option<String>,
+    status_msg: Option<String>,
+    status_time: Instant,
 }
 
 impl Editor {
@@ -107,7 +112,7 @@ impl Editor {
             cx: 0,
             rx: 0,
             cy: 0,
-            screen_rows,
+            screen_rows: screen_rows - STATUS_HEIGHT,
             screen_cols,
             orig_term,
             erows, // NOTE: here erows variable above is moved and becomes invalid after this line
@@ -115,6 +120,9 @@ impl Editor {
             nrows,
             roffset: 0,
             coffset: 0,
+            filename: filename_opt.map(|s| s.to_owned()),
+            status_msg: None,
+            status_time: Instant::now(),
         }
     }
 
@@ -152,6 +160,7 @@ impl Editor {
         // read file
         let mut nrows: usize = 0;
         let mut erows = Vec::new();
+
         if let Some(filename) = filename_opt {
             let file = File::open(filename)?;
             // NOTE: Each line (string) from lines() will not have \n or \r at the end
@@ -168,7 +177,14 @@ impl Editor {
         return Ok((nrows, erows));
     }
 
+    fn set_status_msg(&mut self, msg: &str) {
+        self.status_msg = Some(msg.to_string());
+        self.status_time = Instant::now();
+    }
+
     pub fn run(&mut self) {
+        self.set_status_msg("HELP: Ctrl-Q = quit");
+
         loop {
             self.refresh_screen();
             self.process_keypress();
@@ -213,9 +229,7 @@ impl Editor {
             // NOTE: this replaces whole screen clearing with \x1b[2J
             buf.push_str("\x1b[K");
 
-            if y < self.screen_rows - 1 {
-                buf.push_str("\r\n");
-            }
+            buf.push_str("\r\n");
         }
     }
 
@@ -261,6 +275,44 @@ impl Editor {
         }
     }
 
+    fn draw_status(&self, buf: &mut String) {
+        buf.push_str("\x1b[7m");
+
+        // status message
+        // NOTE: as_deref makes supplying &str in unwrap_or() possible
+        let filename = self.filename.as_deref().unwrap_or("No Name");
+        let status_msg = &format!("{:20} - {} lines", filename, self.nrows);
+        let mut len = cmp::min(status_msg.len(), self.screen_cols);
+        buf.push_str(&status_msg[..len]);
+
+        let row_stat_msg = format!("{}/{}", self.cy + 1, self.nrows);
+
+        while len < self.screen_cols {
+            if self.screen_cols - len == row_stat_msg.len() {
+                buf.push_str(&row_stat_msg);
+                break;
+            } else {
+                buf.push(' ');
+                len += 1;
+            }
+        }
+
+        buf.push_str("\x1b[m");
+
+        // second line below
+        buf.push_str("\r\n");
+    }
+
+    fn draw_msg(&self, buf: &mut String) {
+        // clear line
+        buf.push_str("\x1b[K");
+
+        if self.status_msg.is_some() && self.status_time.elapsed().as_secs() < 5 {
+            let msg: &str = self.status_msg.as_deref().unwrap();
+            buf.push_str(&msg[..cmp::min(msg.len(), self.screen_cols)]);
+        }
+    }
+
     fn refresh_screen(&mut self) {
         self.scroll_screen();
 
@@ -274,6 +326,8 @@ impl Editor {
         buf.push_str("\x1b[H");
 
         self.draw_rows(&mut buf);
+        self.draw_status(&mut buf);
+        self.draw_msg(&mut buf);
 
         // draw cursor position
         buf.push_str(&format!(
