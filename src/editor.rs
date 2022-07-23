@@ -319,22 +319,48 @@ fn cx_to_rx(erow: &str, cx: usize) -> usize {
     return rx;
 }
 
+/** highlights */
+
+#[derive(Clone, Copy, PartialEq)]
+enum HLType {
+    Normal = 0,
+    Number,
+    Match,
+}
+
+impl HLType {
+    fn to_ansi_color(&self) -> u8 {
+        match self {
+            HLType::Number => 31, // red
+            HLType::Match => 34,  // blue
+            _ => 37,
+        }
+    }
+}
+
 struct Row {
     content: String,
     render: String,
+    hl: Vec<HLType>, // 0 - 255 number codes
 }
 
 impl Row {
     pub fn new<T: Into<String>>(ip: T) -> Row {
         // NOTE: <ip> var is moved due to into() and is not usable after the next line
         let content = ip.into();
-        let render = Row::convert_to_rendered(&content);
+        let render = Row::content_to_rendered(&content);
+        let hl = Row::rendered_to_hl(&render);
 
-        Row { content, render }
+        Row {
+            content,
+            render,
+            hl,
+        }
     }
 
     fn update_render(&mut self) {
-        self.render = Row::convert_to_rendered(&self.content);
+        self.render = Row::content_to_rendered(&self.content);
+        self.hl = Row::rendered_to_hl(&self.render);
     }
 
     fn replace_content<T: Into<String>>(&mut self, s: T) {
@@ -360,7 +386,33 @@ impl Row {
         self.update_render();
     }
 
-    fn convert_to_rendered(line: &String) -> String {
+    fn is_digit_separator(c: char) -> bool {
+        c.is_whitespace() || c == '\0' || ",.()+-/*=~%<>[];".contains(c)
+    }
+
+    fn rendered_to_hl(render: &String) -> Vec<HLType> {
+        let mut hl = vec![HLType::Normal; render.len()];
+
+        let mut i = 0;
+
+        while i < render.len() {
+            // TODO: Support unicode properly as .len() above on string returns no. of bytes not characters
+            let c = render.as_bytes()[i] as char;
+            let prev_char_sep = i == 0 || Row::is_digit_separator(render.as_bytes()[i - 1] as char);
+
+            if (c.is_ascii_digit() && (prev_char_sep || hl[i - 1] == HLType::Number))
+                || (c == '.' && hl[i - 1] == HLType::Number)
+            {
+                hl[i] = HLType::Number;
+            }
+
+            i += 1;
+        }
+
+        return hl;
+    }
+
+    fn content_to_rendered(line: &String) -> String {
         // replace all tab characters in the line with appropriate number of spaces
         let mut new_line = String::new();
         let mut tabs = 0;
@@ -470,9 +522,30 @@ impl Editor {
                 // append file contents to buffer
                 let line_len = self.erows[abs_y].render.len();
                 if self.coffset < line_len {
-                    let max_len = cmp::min(self.screen_cols, line_len - self.coffset);
-                    buf.push_str(&self.erows[abs_y].render[self.coffset..self.coffset + max_len]);
+                    let clipped_len = cmp::min(self.screen_cols, line_len - self.coffset);
+                    let mut current_color: i16 = -1; // i16 smallest signed type that allows safe casting from u8
+                    let render_row = &self.erows[abs_y].render[self.coffset..];
+                    let hl_row = &self.erows[abs_y].hl[self.coffset..];
+
+                    for i in 0..clipped_len {
+                        if hl_row[i] == HLType::Normal {
+                            if current_color != -1 {
+                                buf.push_str("\x1b[39m");
+                                current_color = -1;
+                            }
+                            buf.push(render_row.as_bytes()[i] as char);
+                        } else {
+                            let color = hl_row[i].to_ansi_color();
+
+                            if current_color != color as i16 {
+                                current_color = color as i16;
+                                buf.push_str(&format!("\x1b[{}m", color));
+                            }
+                            buf.push(render_row.as_bytes()[i] as char);
+                        }
+                    }
                 }
+                buf.push_str("\x1b[39m");
             }
 
             // clear line to right of cursor position
@@ -855,6 +928,18 @@ impl Editor {
         static mut SEARCH_LAST_MATCH: i64 = -1;
         static mut SEARCH_DIR: i64 = 1;
 
+        static mut SAVED_HL_LINE: Option<usize> = None;
+        static mut SAVED_HL: Option<Vec<HLType>> = None;
+
+        unsafe {
+            if let Some(saved_hl) = &SAVED_HL {
+                self.erows[SAVED_HL_LINE.unwrap()]
+                    .hl
+                    .copy_from_slice(saved_hl);
+                SAVED_HL = None;
+            }
+        }
+
         if key == ENTER || key == EKey::ESCAPE {
             unsafe {
                 SEARCH_LAST_MATCH = -1;
@@ -894,14 +979,22 @@ impl Editor {
                 current = 0;
             }
 
-            let row = &self.erows[current as usize];
+            let nrows = self.erows.len();
+            let row = &mut self.erows[current as usize];
             if let Some(byte_offset) = row.render.find(query) {
                 unsafe {
                     SEARCH_LAST_MATCH = current;
+                    SAVED_HL_LINE = Some(current as usize); // current guaranteed to be >= 0
+                    SAVED_HL = Some(row.hl.to_vec());
                 }
+
                 self.cy = current as usize;
                 self.cx = rx_to_cx(&row.content, byte_offset);
-                self.roffset = self.erows.len();
+                self.roffset = nrows;
+
+                // update matched highlight text color
+                row.hl[byte_offset..byte_offset + query.len()].fill(HLType::Match);
+
                 break;
             }
         }
