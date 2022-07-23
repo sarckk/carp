@@ -37,6 +37,7 @@ const STATUS_HEIGHT: usize = 2;
 const QUIT_TIMES: u8 = 3;
 const ENTER: u32 = '\r' as u32;
 const CTRL_Q: u32 = CTRL('q');
+const CTRL_F: u32 = CTRL('f');
 const CTRL_H: u32 = CTRL('h');
 const CTRL_L: u32 = CTRL('l');
 const CTRL_S: u32 = CTRL('s');
@@ -124,10 +125,6 @@ fn disable_raw_mode(orig_term: &Termios) {
     if let Err(err) = tcsetattr(0, TCSAFLUSH, orig_term) {
         die("tcsetattr", &err.to_string());
     }
-}
-
-const fn CTRL(c: char) -> u32 {
-    (c as u32) & 0x1f
 }
 
 fn read_key() -> u32 {
@@ -282,6 +279,46 @@ where
 
     return Ok(erows);
 }
+
+const fn CTRL(c: char) -> u32 {
+    (c as u32) & 0x1f
+}
+
+/** row helper stuff */
+fn rx_to_cx(erow: &str, target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+
+    let mut rx = 0;
+
+    for (idx, c) in erow.chars().enumerate() {
+        if c == '\t' {
+            rx += (TAB_WIDTH - 1) - (rx % TAB_WIDTH);
+        }
+        rx += 1;
+
+        if rx == target {
+            return idx + 1;
+        }
+    }
+
+    unreachable!("Should always return a valid cx!");
+}
+
+fn cx_to_rx(erow: &str, cx: usize) -> usize {
+    let mut rx = 0;
+
+    for i in 0..cx {
+        if (erow.as_bytes()[i] as char) == '\t' {
+            rx += (TAB_WIDTH - 1) - (rx % TAB_WIDTH);
+        }
+        rx += 1;
+    }
+
+    return rx;
+}
+
 struct Row {
     content: String,
     render: String,
@@ -396,7 +433,7 @@ impl Editor {
     }
 
     pub fn run(&mut self) {
-        self.set_status_msg("HELP: Ctrl-S = save | Ctrl-Q = quit");
+        self.set_status_msg("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
         loop {
             self.refresh_screen();
@@ -447,19 +484,6 @@ impl Editor {
     }
 
     /** erows operations  */
-    fn cx_to_rx(erows: &str, cx: usize) -> usize {
-        let mut rx = 0;
-
-        for i in 0..cx {
-            if (erows.as_bytes()[i] as char) == '\t' {
-                rx += (TAB_WIDTH - 1) - (rx % TAB_WIDTH);
-            }
-            rx += 1;
-        }
-
-        return rx;
-    }
-
     fn insert_row_at<T>(&mut self, at: usize, row: T)
     where
         T: Into<String>,
@@ -540,7 +564,7 @@ impl Editor {
         self.rx = self.cx;
         if self.cy < self.erows.len() {
             // we are not at the last allowed line of the editor (i.e. one line after end of text)
-            self.rx = Editor::cx_to_rx(&self.erows[self.cy].content, self.cx);
+            self.rx = cx_to_rx(&self.erows[self.cy].content, self.cx);
         }
 
         // if cursor goes above the top of screen display, change roffset
@@ -674,7 +698,11 @@ impl Editor {
         }
     }
 
-    fn prompt(&mut self, format_str: &str) -> Option<String> {
+    fn prompt(
+        &mut self,
+        format_str: &str,
+        callback: Option<fn(&mut Editor, &str, u32)>,
+    ) -> Option<String> {
         // TODO: Rust doesn't support dynamic string formatting out of the box
         // Crates like dynfmt solve it, but just use simple replace now
         let mut buf = String::new();
@@ -687,17 +715,27 @@ impl Editor {
                 buf.pop();
             } else if key == EKey::ESCAPE {
                 self.set_status_msg("");
+                if let Some(cb) = callback {
+                    cb(self, &buf, key);
+                }
                 return None;
             } else if key == ENTER {
                 if !buf.is_empty() {
                     // successfully got the filename
                     self.set_status_msg("");
+                    if let Some(cb) = callback {
+                        cb(self, &buf, key);
+                    }
                     return Some(buf);
                 }
             } else if key < 128 && !(key as u8 as char).is_control() {
                 // TODO: hacky, but keep until full unicode support
                 // NOTE: key < 128 ensures that it can be represented as u8
                 buf.push(key as u8 as char);
+            }
+
+            if let Some(cb) = callback {
+                cb(self, &buf, key);
             }
         }
     }
@@ -724,6 +762,9 @@ impl Editor {
                 io::stdout().flush().unwrap();
                 self.cleanup();
                 std::process::exit(0);
+            }
+            CTRL_F => {
+                self.find();
             }
             CTRL_S => match self.save() {
                 Ok(len) => {
@@ -793,7 +834,7 @@ impl Editor {
 
     fn save(&mut self) -> Result<usize, FileSaveError> {
         if self.filename.is_none() {
-            self.filename = self.prompt("Save as: {} (Esc to cancel)");
+            self.filename = self.prompt("Save as: {} (Esc to cancel)", None);
             if self.filename.is_none() {
                 self.set_status_msg("Save aborted");
                 return Err(FileSaveError::NoFileSpecifiedError);
@@ -806,6 +847,84 @@ impl Editor {
         file.write_all(content.as_bytes())?;
         self.dirty = false;
         Ok(content.len())
+    }
+
+    /** search */
+    fn find_callback(&mut self, query: &str, key: u32) {
+        // i64 makes conversion from usize safe
+        static mut SEARCH_LAST_MATCH: i64 = -1;
+        static mut SEARCH_DIR: i64 = 1;
+
+        if key == ENTER || key == EKey::ESCAPE {
+            unsafe {
+                SEARCH_LAST_MATCH = -1;
+                SEARCH_DIR = 1;
+            }
+            return;
+        } else if key == EKey::ARROW_DOWN || key == EKey::ARROW_RIGHT {
+            // next match
+            unsafe {
+                SEARCH_DIR = 1;
+            }
+        } else if key == EKey::ARROW_UP || key == EKey::ARROW_LEFT {
+            // prev match
+            unsafe {
+                SEARCH_DIR = -1;
+            }
+        } else {
+            unsafe {
+                SEARCH_LAST_MATCH = -1;
+                SEARCH_DIR = 1;
+            }
+        }
+
+        if unsafe { SEARCH_LAST_MATCH == -1 } {
+            unsafe {
+                SEARCH_DIR = 1;
+            }
+        }
+
+        let mut current = unsafe { SEARCH_LAST_MATCH };
+        for _ in 0..self.erows.len() {
+            current += unsafe { SEARCH_DIR };
+            if current == -1 {
+                current = (self.erows.len() - 1) as i64;
+            }
+            if current == self.erows.len() as i64 {
+                current = 0;
+            }
+
+            let row = &self.erows[current as usize];
+            if let Some(byte_offset) = row.render.find(query) {
+                unsafe {
+                    SEARCH_LAST_MATCH = current;
+                }
+                self.cy = current as usize;
+                self.cx = rx_to_cx(&row.content, byte_offset);
+                self.roffset = self.erows.len();
+                break;
+            }
+        }
+    }
+
+    fn find(&mut self) {
+        let saved_cx = self.cx;
+        let saved_cy = self.cy;
+        let saved_coffset = self.coffset;
+        let saved_roffset = self.roffset;
+
+        if self
+            .prompt(
+                "Search: {} (Use ESC/Arrows/Enter)",
+                Some(Editor::find_callback),
+            )
+            .is_none()
+        {
+            self.cx = saved_cx;
+            self.cy = saved_cy;
+            self.coffset = saved_coffset;
+            self.roffset = saved_roffset;
+        }
     }
 
     pub fn cleanup(&self) {
