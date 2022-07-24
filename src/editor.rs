@@ -1,437 +1,63 @@
 extern crate libc;
 
-use sscanf::scanf;
-use std::cmp;
-use std::fmt;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::path::Path;
-use std::slice::{self};
-use std::time::Instant;
+mod constant;
+mod errors;
+mod helpers;
 
+use constant::*;
+use errors::FileSaveError;
+use helpers::*;
+
+use std::cmp;
+use std::fs::File;
+use std::io::{self, Write};
+use std::time::Instant;
 use termios::*;
 
-use libc::{ioctl, winsize, STDOUT_FILENO, TIOCGWINSZ};
-
-#[non_exhaustive]
-struct EKey;
-
-impl EKey {
-    pub const ESCAPE: u32 = '\x1b' as u32;
-    pub const BACKSPACE: u32 = 127;
-    pub const ARROW_LEFT: u32 = 1000;
-    pub const ARROW_RIGHT: u32 = 1001;
-    pub const ARROW_UP: u32 = 1002;
-    pub const ARROW_DOWN: u32 = 1003;
-    pub const DEL_KEY: u32 = 1004;
-    pub const HOME_KEY: u32 = 1005;
-    pub const END_KEY: u32 = 1006;
-    pub const PAGE_UP: u32 = 1007;
-    pub const PAGE_DOWN: u32 = 1008;
-}
-
-const EAGAIN: i32 = 11;
-const CARP_VER: &str = "0.0.1";
-const TAB_WIDTH: usize = 8;
-const STATUS_HEIGHT: usize = 2;
-const QUIT_TIMES: u8 = 3;
-const ENTER: u32 = '\r' as u32;
-const CTRL_Q: u32 = CTRL('q');
-const CTRL_F: u32 = CTRL('f');
-const CTRL_H: u32 = CTRL('h');
-const CTRL_L: u32 = CTRL('l');
-const CTRL_S: u32 = CTRL('s');
-
-/** custom error for file saving */
-enum FileSaveError {
-    Io(io::Error),
-    NoFileSpecifiedError,
-}
-
-impl fmt::Display for FileSaveError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            FileSaveError::Io(ref cause) => write!(f, "I/O Error: {}", cause),
-            FileSaveError::NoFileSpecifiedError => write!(f, "No file specified for saving!"),
-        }
-    }
-}
-
-impl From<io::Error> for FileSaveError {
-    fn from(cause: io::Error) -> FileSaveError {
-        FileSaveError::Io(cause)
-    }
-}
-
-/** terminal stuff */
-fn enable_raw_mode() -> Termios {
-    let termios = match Termios::from_fd(0) {
-        Ok(instance) => instance,
-        Err(err) => die("tcgetattr", &err.to_string()),
-    };
-
-    let mut raw_termios = termios.clone();
-    raw_termios.c_iflag &= !(BRKINT | INPCK | ISTRIP | ICRNL | IXON);
-    raw_termios.c_oflag &= !(OPOST);
-    raw_termios.c_cflag |= CS8;
-    raw_termios.c_lflag &= !(ICANON | ECHO | ISIG | IEXTEN);
-    raw_termios.c_cc[VMIN] = 0;
-    raw_termios.c_cc[VTIME] = 1; // per 0.1s
-
-    if let Err(err) = tcsetattr(0, TCSAFLUSH, &mut raw_termios) {
-        die("tcsetattr", &err.to_string());
-    }
-
-    // sending smcup command to enable making Page UP / DOWN work on macOS
-    io::stdout().write(b"\033[?47h").unwrap();
-    io::stdout().flush().unwrap();
-
-    return termios;
-}
-
-fn get_win_size() -> io::Result<(usize, usize)> {
-    let wsz = winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-
-    if unsafe { ioctl(STDOUT_FILENO, TIOCGWINSZ, &wsz) } == -1 || wsz.ws_col == 0 {
-        // move cursor to bottom right (C = Cursor Forward, B = Cursor Down)
-        let n = io::stdout().write(b"\x1b[999C\x1b[999B")?;
-        io::stdout().flush()?;
-        if n != 12 {
-            return Err(io::Error::last_os_error());
-        }
-        let res = get_cursor_pos();
-        // if let Ok((r,c)) = res {
-        //     eprintln!("rows: {} | cols: {} \r", r, c);
-        // }
-        return res;
-    }
-
-    // eprintln!("rows: {} | cols: {} \r", wsz.ws_row, wsz.ws_col);
-    Ok((wsz.ws_row as usize, wsz.ws_col as usize))
-}
-
-fn disable_raw_mode(orig_term: &Termios) {
-    // sending rmcup command to disable making Page UP / DOWN work macOS
-    io::stdout().write(b"\033[?47l").unwrap();
-    // reset cursor position, this seems to prevent weird whitespace at top of terminal after exiting
-    io::stdout().write(b"\x1b[H").unwrap();
-    io::stdout().flush().unwrap();
-
-    if let Err(err) = tcsetattr(0, TCSAFLUSH, orig_term) {
-        die("tcsetattr", &err.to_string());
-    }
-}
-
-fn read_key() -> u32 {
-    let mut buffer = [0; 1];
-
-    while let Err(err) = io::stdin().read_exact(&mut buffer) {
-        if let Some(errno) = err.raw_os_error() {
-            if errno != EAGAIN {
-                die("read", &err.to_string());
-            }
-        }
-    }
-
-    if buffer[0] as char == '\x1b' {
-        let mut seq = [0 as u8; 3];
-
-        for i in 0..2 {
-            if io::stdin()
-                .read_exact(slice::from_mut(&mut seq[i]))
-                .is_err()
-            {
-                return '\x1b' as u32;
-            }
-        }
-
-        if seq[0] as char == '[' {
-            let second_ch = seq[1] as char;
-
-            if second_ch >= '0' && second_ch <= '9' {
-                if io::stdin()
-                    .read_exact(slice::from_mut(&mut seq[2]))
-                    .is_err()
-                {
-                    return '\x1b' as u32;
-                }
-
-                let third_ch = seq[2] as char;
-
-                if third_ch == '~' {
-                    return match second_ch {
-                        '1' | '7' => EKey::HOME_KEY,
-                        '3' => EKey::DEL_KEY,
-                        '4' | '8' => EKey::END_KEY,
-                        '5' => EKey::PAGE_UP,
-                        '6' => EKey::PAGE_DOWN,
-                        _ => EKey::ESCAPE,
-                    } as u32;
-                }
-            } else {
-                return match seq[1] as char {
-                    'A' => EKey::ARROW_UP,
-                    'B' => EKey::ARROW_DOWN,
-                    'C' => EKey::ARROW_RIGHT,
-                    'D' => EKey::ARROW_LEFT,
-                    'H' => EKey::HOME_KEY,
-                    'F' => EKey::END_KEY,
-                    _ => EKey::ESCAPE,
-                } as u32;
-            }
-        } else if seq[0] as char == 'O' {
-            return match seq[1] as char {
-                'H' => EKey::HOME_KEY,
-                'F' => EKey::END_KEY,
-                _ => EKey::ESCAPE,
-            } as u32;
-        }
-
-        return '\x1b' as u32;
-    }
-
-    return buffer[0] as u32;
-}
-
-// note: diverging function, returns !
-fn die(msg: &str, error: &str) -> ! {
-    io::stdout().write(b"\x1b[2J").unwrap();
-    io::stdout().write(b"\x1b[H").unwrap();
-    io::stdout().flush().unwrap();
-    eprintln!("{}: {}", msg, error);
-    panic!();
-}
-
-fn get_cursor_pos() -> io::Result<(usize, usize)> {
-    if io::stdout().write(b"\x1b[6n").unwrap() != 4 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // NOTE: we need to flush stdout
-    io::stdout().flush()?;
-
-    let mut buffer = [0 as u8; 32];
-    let mut i = 0;
-
-    // buffer shoud be 32 bytes
-    while i < 31 {
-        // read a single byte from stdin
-        let res = io::stdin().read_exact(slice::from_mut(&mut buffer[i]));
-
-        if let Err(_) = res {
-            break;
-        }
-
-        // print!("i: {} | {} \r\n", i, buffer[i] as char);
-
-        if (buffer[i] as char) == 'R' {
-            break;
-        }
-
-        i += 1;
-    }
-
-    // print!("\r\n&buf[1]: '{:?}'\r\n", &buffer[1..32]);
-    if (buffer[0] as char) != '\x1b' || (buffer[1] as char) != '[' {
-        return Err(io::Error::last_os_error());
-    }
-
-    // NOTE: Rust doesn't seem to use NULL character to demarcate end of string, like:
-    // buffer[i] = 0x00; // equivalent to '\0' NULL character
-    // For now, we trim it, but maybe in future we can use Vec::with_capacity()
-    let trim_buf = &buffer[2..i];
-
-    // TODO: handle this better as we are now just mapping the error to ErrorKind::InvalidInput to satisfy IO Error type
-    let buf_str: &str = std::str::from_utf8(&trim_buf).map_err(|_| ErrorKind::InvalidInput)?;
-
-    let parsed = scanf!(buf_str, "{};{}", u16, u16);
-
-    if let Ok((row, col)) = parsed {
-        return Ok((row as usize, col as usize));
-    }
-
-    return Err(io::Error::last_os_error());
-}
-
-/** helper functions */
-fn read_file<P>(filename_opt: Option<&P>) -> io::Result<Vec<Row>>
-where
-    P: AsRef<Path>,
-{
-    let mut erows: Vec<Row> = Vec::new();
-
-    if let Some(filename) = filename_opt {
-        let file = File::open(filename)?;
-        // NOTE: Each line (string) from lines() will not have \n or \r at the end
-        // TODO: optimize by reusing buffer for buffer reader. See https://stackoverflow.com/questions/45882329/read-large-files-line-by-line-in-rust
-        for line in BufReader::new(file).lines() {
-            if let Ok(ip) = line {
-                // we need to append this to the erows
-                erows.push(Row::new(&ip));
-            }
-        }
-    }
-
-    return Ok(erows);
-}
-
-const fn CTRL(c: char) -> u32 {
-    (c as u32) & 0x1f
-}
-
-/** row helper stuff */
-fn rx_to_cx(erow: &str, target: usize) -> usize {
-    if target == 0 {
-        return 0;
-    }
-
-    let mut rx = 0;
-
-    for (idx, c) in erow.chars().enumerate() {
-        if c == '\t' {
-            rx += (TAB_WIDTH - 1) - (rx % TAB_WIDTH);
-        }
-        rx += 1;
-
-        if rx == target {
-            return idx + 1;
-        }
-    }
-
-    unreachable!("Should always return a valid cx!");
-}
-
-fn cx_to_rx(erow: &str, cx: usize) -> usize {
-    let mut rx = 0;
-
-    for i in 0..cx {
-        if (erow.as_bytes()[i] as char) == '\t' {
-            rx += (TAB_WIDTH - 1) - (rx % TAB_WIDTH);
-        }
-        rx += 1;
-    }
-
-    return rx;
-}
-
 /** highlights */
-
 #[derive(Clone, Copy, PartialEq)]
-enum HLType {
+pub enum HLType {
     Normal = 0,
     Number,
     Match,
+    String,
+    Comment,
+    MLComment,
+    Keyword1,
+    Keyword2,
 }
 
 impl HLType {
-    fn to_ansi_color(&self) -> u8 {
+    pub fn to_ansi_color(&self) -> u8 {
         match self {
-            HLType::Number => 31, // red
-            HLType::Match => 34,  // blue
+            HLType::Number => 31,  // red
+            HLType::Match => 34,   // blue
+            HLType::String => 35,  // magenta
+            HLType::Comment => 36, // cyan
+            HLType::MLComment => 36,
+            HLType::Keyword1 => 33, // yellow
+            HLType::Keyword2 => 32, // green
             _ => 37,
         }
     }
 }
 
 struct Row {
-    content: String,
-    render: String,
-    hl: Vec<HLType>, // 0 - 255 number codes
+    pub idx: usize,
+    pub content: String,
+    pub render: String,
+    pub hl: Vec<HLType>, // 0 - 255 number codes
+    pub hl_open_comment: bool,
 }
-
-impl Row {
-    pub fn new<T: Into<String>>(ip: T) -> Row {
-        // NOTE: <ip> var is moved due to into() and is not usable after the next line
-        let content = ip.into();
-        let render = Row::content_to_rendered(&content);
-        let hl = Row::rendered_to_hl(&render);
-
-        Row {
-            content,
-            render,
-            hl,
-        }
-    }
-
-    fn update_render(&mut self) {
-        self.render = Row::content_to_rendered(&self.content);
-        self.hl = Row::rendered_to_hl(&self.render);
-    }
-
-    fn replace_content<T: Into<String>>(&mut self, s: T) {
-        self.content = s.into();
-        self.update_render();
-    }
-
-    fn del_char(&mut self, at: usize) {
-        if at >= self.content.len() {
-            return; // prevent panic! for remove() call below
-        }
-        self.content.remove(at);
-        self.update_render();
-    }
-
-    fn insert_char(&mut self, at: usize, c: char) {
-        self.content.insert(cmp::min(at, self.content.len()), c);
-        self.update_render();
-    }
-
-    fn append_str(&mut self, s: &str) {
-        self.content.push_str(s);
-        self.update_render();
-    }
-
-    fn is_digit_separator(c: char) -> bool {
-        c.is_whitespace() || c == '\0' || ",.()+-/*=~%<>[];".contains(c)
-    }
-
-    fn rendered_to_hl(render: &String) -> Vec<HLType> {
-        let mut hl = vec![HLType::Normal; render.len()];
-
-        let mut i = 0;
-
-        while i < render.len() {
-            // TODO: Support unicode properly as .len() above on string returns no. of bytes not characters
-            let c = render.as_bytes()[i] as char;
-            let prev_char_sep = i == 0 || Row::is_digit_separator(render.as_bytes()[i - 1] as char);
-
-            if (c.is_ascii_digit() && (prev_char_sep || hl[i - 1] == HLType::Number))
-                || (c == '.' && hl[i - 1] == HLType::Number)
-            {
-                hl[i] = HLType::Number;
-            }
-
-            i += 1;
-        }
-
-        return hl;
-    }
-
-    fn content_to_rendered(line: &String) -> String {
-        // replace all tab characters in the line with appropriate number of spaces
-        let mut new_line = String::new();
-        let mut tabs = 0;
-        for ch in line.chars() {
-            if ch == '\t' {
-                new_line.push(' ');
-                if (tabs + 1) % TAB_WIDTH != 0 {
-                    let nspaces = TAB_WIDTH - ((tabs + 1) % TAB_WIDTH);
-                    let tab_spaces = " ".repeat(nspaces);
-                    new_line.push_str(&tab_spaces);
-                }
-                tabs = 0;
-            } else {
-                new_line.push(ch);
-                tabs += 1;
-            }
-        }
-        return new_line;
-    }
+#[derive(Clone)]
+pub struct EditorSyntax {
+    filetype: &'static str,
+    filematch: &'static [&'static str],
+    keywords: &'static [&'static str],
+    single_line_comment_start: &'static str,
+    multiline_comment_start: &'static str,
+    multiline_comment_end: &'static str,
+    flags: u8,
 }
 
 pub struct Editor {
@@ -448,18 +74,15 @@ pub struct Editor {
     status_msg: Option<String>,
     status_time: Instant,
     dirty: bool,
+    syntax: Option<EditorSyntax>,
 }
 
 impl Editor {
-    pub fn new(filename_opt: Option<&String>) -> Self {
+    pub fn new() -> Self {
         let orig_term = enable_raw_mode();
 
         let (screen_rows, screen_cols) = get_win_size().unwrap_or_else(|err| {
             die("getWindowSize", &err.to_string());
-        });
-
-        let erows = read_file(filename_opt).unwrap_or_else(|err| {
-            die("fopen", &err.to_string());
         });
 
         Self {
@@ -469,13 +92,60 @@ impl Editor {
             screen_rows: screen_rows - STATUS_HEIGHT,
             screen_cols,
             orig_term,
-            erows,
+            erows: Vec::new(),
             roffset: 0,
             coffset: 0,
-            filename: filename_opt.map(|s| s.to_owned()),
+            filename: None,
             status_msg: None,
             status_time: Instant::now(),
             dirty: false,
+            syntax: None,
+        }
+    }
+
+    pub fn open(&mut self, filename_opt: Option<&String>) -> &mut Self {
+        self.filename = filename_opt.map(|s| s.to_owned());
+        self.update_syntax();
+
+        let lines = read_file(filename_opt).unwrap_or_else(|err| {
+            die("fopen", &err.to_string());
+        });
+
+        for line in lines {
+            self.insert_row_at(self.erows.len(), line);
+        }
+
+        self.dirty = false;
+
+        self
+    }
+
+    fn update_syntax(&mut self) {
+        self.syntax = None;
+
+        if self.filename.is_none() {
+            return;
+        }
+
+        let name = self.filename.as_deref().unwrap();
+        let ext = name.rfind('.');
+
+        for hldb_entry in HLDB {
+            for &pattern in hldb_entry.filematch {
+                let is_ext = pattern.starts_with('.');
+                // Rust compares values behind references (&str) due to default implementation of PartialEq<&str> for &str
+                if (is_ext && ext.is_some() && &name[ext.unwrap()..] == pattern)
+                    || (!is_ext && name.contains(pattern))
+                {
+                    self.syntax = Some(hldb_entry.clone());
+
+                    for i in 0..self.erows.len() {
+                        self.row_update_syntax(i);
+                    }
+
+                    return;
+                }
+            }
         }
     }
 
@@ -528,9 +198,15 @@ impl Editor {
                     let hl_row = &self.erows[abs_y].hl[self.coffset..];
 
                     for i in 0..clipped_len {
-                        if hl_row[i] == HLType::Normal {
+                        let c = render_row.as_bytes()[i];
+                        if c.is_ascii_control() {
+                            let sym = if c <= 26 { '@' as u8 + c } else { '?' as u8 };
+                            buf.push_str("\x1b[7m"); // inverted bg color
+                            buf.push(sym as char);
+                            buf.push_str("\x1b[m"); // restore default
+                        } else if hl_row[i] == HLType::Normal {
                             if current_color != -1 {
-                                buf.push_str("\x1b[39m");
+                                buf.push_str("\x1b[39m"); // default font color
                                 current_color = -1;
                             }
                             buf.push(render_row.as_bytes()[i] as char);
@@ -557,15 +233,30 @@ impl Editor {
     }
 
     /** erows operations  */
-    fn insert_row_at<T>(&mut self, at: usize, row: T)
+    fn insert_row_at<T>(&mut self, at: usize, content: T)
     where
         T: Into<String>,
     {
-        let mut idx = at;
         if at > self.erows.len() {
-            idx = self.erows.len();
+            return;
         }
-        self.erows.insert(idx, Row::new(row.into()));
+        self.erows.insert(
+            at,
+            Row {
+                idx: at,
+                content: content.into(),
+                render: String::new(),
+                hl: Vec::new(),
+                hl_open_comment: false,
+            },
+        );
+
+        for i in at + 1..self.erows.len() {
+            self.erows[i].idx += 1;
+        }
+
+        self.row_update(at);
+
         self.dirty = true;
     }
 
@@ -574,17 +265,208 @@ impl Editor {
             return;
         }
         self.erows.remove(at);
+
+        for i in at..self.erows.len() {
+            self.erows[i].idx -= 1;
+        }
+
         self.dirty = true;
     }
 
     /** editor operations  */
+    fn row_update_syntax(&mut self, row_idx: usize) {
+        let (left, _right) = self.erows.split_at(row_idx);
+        // NOTE: we need to set the value of in_comment here first so the borrow checker doesn't complain!
+        let mut in_comment = left.last().map(|row| row.hl_open_comment).unwrap_or(false);
+
+        let row = &mut self.erows[row_idx];
+        let mut hl = vec![HLType::Normal; row.render.len()];
+
+        if self.syntax.is_none() {
+            row.hl = hl;
+            return;
+        }
+
+        let mut i = 0;
+        let mut prev_sep = true; // count beginning of line as preceding a separator
+
+        let mut in_string = '\0'; // if not current in string, this should be NULL char
+
+        let esyntax = self.syntax.as_ref().unwrap();
+
+        let scs = esyntax.single_line_comment_start;
+        let mcs = esyntax.multiline_comment_start;
+        let mce = esyntax.multiline_comment_end;
+
+        while i < row.render.len() {
+            // TODO: Support unicode properly as .len() above on string returns no. of bytes not characters
+            let c = row.render.as_bytes()[i] as char;
+            let prev_hl = if i == 0 { HLType::Normal } else { hl[i - 1] };
+
+            // highlight comments
+            if !scs.is_empty() && in_string == '\0' && !in_comment {
+                if row.render[i..].starts_with(scs) {
+                    hl[i..].fill(HLType::Comment);
+                    break;
+                }
+            }
+
+            // multi-line comments
+            if !mcs.is_empty() && !mce.is_empty() && in_string == '\0' {
+                if in_comment {
+                    hl[i] = HLType::MLComment;
+                    if row.render[i..].starts_with(mce) {
+                        hl[i..i + mce.len()].fill(HLType::MLComment);
+                        i += mce.len();
+                        in_comment = false;
+                        prev_sep = true;
+                        continue;
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else if row.render[i..].starts_with(mcs) {
+                    hl[i..i + mcs.len()].fill(HLType::MLComment);
+                    i += mcs.len();
+                    in_comment = true;
+                    continue;
+                }
+            }
+
+            if (esyntax.flags & HL_HIGHLIGHT_STRINGS) != 0 {
+                if in_string != '\0' {
+                    hl[i] = HLType::String;
+
+                    if c == in_string {
+                        in_string = '\0';
+                    }
+
+                    if c == '\\' && i + 1 < row.render.len() {
+                        hl[i + 1] = HLType::String;
+                        i += 2;
+                        continue;
+                    }
+
+                    i += 1;
+                    prev_sep = true;
+                    continue;
+                } else {
+                    // string literals start with either " or '
+                    if c == '"' || c == '\'' {
+                        in_string = c;
+                        hl[i] = HLType::String;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            if (esyntax.flags & HL_HIGHLIGHT_NUMBERS) != 0 {
+                if (c.is_ascii_digit() && (prev_sep || prev_hl == HLType::Number))
+                    || (c == '.' && prev_hl == HLType::Number)
+                {
+                    hl[i] = HLType::Number;
+                }
+            }
+
+            if prev_sep {
+                // TODO: clean up
+                // keyword must be preceded and followed by a separator
+                let mut found = false;
+
+                for &keyw in esyntax.keywords {
+                    let mut kw = keyw;
+                    let kw2: bool = keyw.ends_with('|');
+                    if kw2 {
+                        kw = &kw[..kw.len() - 1];
+                    }
+                    let wlen = kw.len();
+
+                    if row.render[i..].starts_with(kw)
+                        && (i+wlen == row.render.len() // NOTE: need to do this because rust strings arent terminated with '\0'
+                            || is_separator(row.render.as_bytes()[i+wlen] as char))
+                    {
+                        found = true;
+                        let htype = if kw2 {
+                            HLType::Keyword2
+                        } else {
+                            HLType::Keyword1
+                        };
+                        hl[i..(i + wlen)].fill(htype);
+                        i += wlen;
+                        break;
+                    }
+                }
+
+                if found {
+                    prev_sep = false;
+                    continue;
+                }
+            }
+
+            prev_sep = is_separator(c);
+            i += 1;
+        }
+        row.hl = hl;
+
+        let changed = row.hl_open_comment != in_comment;
+        row.hl_open_comment = in_comment;
+        if changed && row_idx + 1 < self.erows.len() {
+            self.row_update_syntax(row_idx + 1);
+        }
+    }
+
+    fn row_update(&mut self, row_idx: usize) {
+        let row = &mut self.erows[row_idx];
+        row.render.clear(); // ensure that render is empty before populating it again
+
+        // replace all tab characters in the line with appropriate number of spaces
+        let mut tabs = 0;
+        for ch in row.content.chars() {
+            if ch == '\t' {
+                row.render.push(' ');
+                if (tabs + 1) % TAB_WIDTH != 0 {
+                    let nspaces = TAB_WIDTH - ((tabs + 1) % TAB_WIDTH);
+                    let tab_spaces = " ".repeat(nspaces);
+                    row.render.push_str(&tab_spaces);
+                }
+                tabs = 0;
+            } else {
+                row.render.push(ch);
+                tabs += 1;
+            }
+        }
+        self.row_update_syntax(row_idx);
+    }
+
+    fn row_insert_char(&mut self, row_idx: usize, at: usize, c: char) {
+        let row = &mut self.erows[row_idx];
+        row.content.insert(cmp::min(at, row.content.len()), c);
+        self.row_update(row_idx);
+    }
+
+    fn row_del_char(&mut self, row_idx: usize, at: usize) {
+        let row = &mut self.erows[row_idx];
+        if at >= row.content.len() {
+            return;
+        }
+        row.content.remove(at);
+        self.row_update(row_idx);
+    }
+
+    fn row_append_str(&mut self, row_idx: usize, s: &str) {
+        let row = &mut self.erows[row_idx];
+        row.content.push_str(s);
+        self.row_update(row_idx);
+    }
+
     fn insert_char(&mut self, c: char) {
         if self.cy == self.erows.len() {
             // one line after the last text, so we start a new empty row
             self.insert_row_at(self.erows.len(), "");
         }
 
-        self.erows[self.cy].insert_char(self.cx, c);
+        self.row_insert_char(self.cy, self.cx, c);
         self.dirty = true;
         self.cx += 1;
     }
@@ -599,14 +481,12 @@ impl Editor {
         }
 
         if self.cx > 0 {
-            let row = &mut self.erows[self.cy];
-            row.del_char(self.cx - 1);
+            self.row_del_char(self.cy, self.cx - 1);
             self.cx -= 1;
         } else {
-            let curr_row_content = self.erows[self.cy].content.to_owned();
-            let prev_row = &mut self.erows[self.cy - 1]; // guaranteed to exist
-            self.cx = prev_row.content.len();
-            prev_row.append_str(&curr_row_content);
+            self.cx = self.erows[self.cy - 1].content.len();
+            let content = &self.erows[self.cy].content.clone();
+            self.row_append_str(self.cy - 1, content);
             self.del_row(self.cy);
             self.cy -= 1;
         }
@@ -617,15 +497,17 @@ impl Editor {
         if self.cx == 0 {
             self.insert_row_at(self.cy, "");
         } else {
-            let mut cur_row = &mut self.erows[self.cy]; // guaranteed to exist as cx > 0
-
             // TODO: change all this when handling unicode correctly
-            let next_row_str: String = cur_row.content.chars().skip(self.cx).collect();
-            self.insert_row_at(self.cy + 1, next_row_str);
+            let next_line = self.erows[self.cy]
+                .content
+                .chars()
+                .skip(self.cx)
+                .collect::<String>();
+            self.insert_row_at(self.cy + 1, next_line);
 
-            cur_row = &mut self.erows[self.cy];
-            let cur_row_new: String = cur_row.content.chars().take(self.cx).collect();
-            cur_row.replace_content(cur_row_new);
+            let row = &mut self.erows[self.cy];
+            row.content = row.content.chars().take(self.cx).collect();
+            self.row_update(self.cy);
         }
 
         self.cy += 1;
@@ -668,7 +550,7 @@ impl Editor {
         let filename = self.filename.as_deref().unwrap_or("No Name");
         let file_dirty_msg = if self.dirty { "(modified)" } else { "" };
         let status_msg = &format!(
-            "{:20} - {} lines {}",
+            "{:.20} - {} lines {}",
             filename,
             self.erows.len(),
             file_dirty_msg
@@ -676,7 +558,13 @@ impl Editor {
         let mut len = cmp::min(status_msg.len(), self.screen_cols);
         buf.push_str(&status_msg[..len]);
 
-        let row_stat_msg = format!("{}/{}", self.cy + 1, self.erows.len());
+        let filetype = self
+            .syntax
+            .as_ref()
+            .map(|syntax_struct| syntax_struct.filetype)
+            .unwrap_or("no ft");
+
+        let row_stat_msg = format!("{} | {}/{}", filetype, self.cy + 1, self.erows.len());
 
         while len < self.screen_cols {
             if self.screen_cols - len == row_stat_msg.len() {
@@ -885,8 +773,8 @@ impl Editor {
             }
             EKey::ESCAPE | CTRL_L => {}
             _ => {
-                // at this point we know that the only possible return value is in u8 because we exhaustively matched all enums
-                // that fall outside the u8 range
+                // at this point we know that the only possible return value is in u8
+                // because we exhaustively matched all enums that fall outside the u8 range
                 self.insert_char(key as u8 as char);
             }
         }
@@ -912,6 +800,7 @@ impl Editor {
                 self.set_status_msg("Save aborted");
                 return Err(FileSaveError::NoFileSpecifiedError);
             }
+            self.update_syntax();
         }
 
         let content = self.erows_to_str();
